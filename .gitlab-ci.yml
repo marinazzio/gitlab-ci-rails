@@ -1,0 +1,159 @@
+image: ruby:2.4
+
+stages:
+  - prepare
+  - check
+  - lint
+  - test
+  - deploy
+  - finish
+
+cache:
+  paths:
+    - vendor/ruby
+
+variables:
+
+before_script:
+  - apt-get update -qq && apt-get install -y -qq nodejs
+  - ruby -v
+  - which ruby
+  - gem install bundler --no-ri --no-rdoc
+  - bundle install --jobs $(nproc) --path=/cache/bundler "${FLAGS[@]}"
+
+.use-db: &use-db
+  services:
+    - postgres:latest
+  variables:
+    POSTGRES_DB: mkgu_region_test
+    POSTGRES_USER: runner
+    POSTGRES_PASSWORD: ""
+    DATABASE_URL: postgres://runner@postgres
+
+rspec:
+  <<: *use-db
+  stage: test
+  script:
+    - bundle exec rails spec
+  artifacts:
+    expire_in: 31d
+    when: always
+    paths:
+      - coverage/
+
+spinach:
+  <<: *use-db
+  stage: test
+  script:
+    - bundle exec spinach
+
+rubocop:
+  stage: lint
+  script:
+    - bundle exec rubocop
+
+haml_lint:
+  stage: lint
+  script:
+    - bundle exec haml-lint app/views
+
+scss_lint:
+  stage: lint
+  script:
+    - bundle exec scss-lint app/assets/stylesheets
+
+flay:
+  stage: check
+  script:
+    - bundle exec flay app
+
+bundle-audit:
+  stage: check
+  script:
+    - bundle exec bundle-audit
+
+brakeman:
+  stage: check
+  script:
+    - bundle exec rake brakeman
+
+pages:
+  before_script: []
+  stage: finish
+  script:
+    - mv public/ .public/
+    - mkdir public/
+    - mv coverage/ public/coverage-ruby/ || true
+  artifacts:
+    paths:
+      - public
+  only:
+    - master
+
+deploy_review:
+  before_script: []
+  stage: deploy
+  script:
+    - echo "Deploy a review app"
+    - ruby -v
+    - rsync -av --delete ./* /home/gitlab-runner/review-apps/${CI_COMMIT_REF_SLUG}
+    - cd /home/gitlab-runner/review-apps/${CI_COMMIT_REF_SLUG}
+    - bundle install --jobs $(nproc) --path=~/cache/bundler "${FLAGS[@]}"
+    - bin/review_up.sh ${CI_COMMIT_REF_SLUG}
+    - mkdir -p tmp/sockets tmp/pids
+    - bundle exec puma -d -e development -b unix:///home/gitlab-runner/review-apps/${CI_COMMIT_REF_SLUG}/tmp/sockets/puma.sock --pidfile /home/gitlab-runner/review-apps/${CI_COMMIT_REF_SLUG}/tmp/pids/puma.pid
+    - bin/check_while_puma_is_up.sh ${CI_COMMIT_REF_SLUG}
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    url: http://$CI_COMMIT_REF_SLUG.example.com
+  variables:
+    DATABASE_URL: "postgres://postgres@localhost/database_review"
+  only:
+    - branches
+  except:
+    - master
+  tags:
+    - review-apps
+
+stop_review:
+  before_script: []
+  stage: deploy
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "Remove review app"
+    - bundle exec pumactl --pidfile /home/gitlab-runner/review-apps/${CI_COMMIT_REF_SLUG}/tmp/pids/puma.pid stop
+    - bin/review_down.sh ${CI_COMMIT_REF_SLUG}
+  when: manual
+  environment:
+    name: review/$CI_COMMIT_REF_NAME
+    action: stop
+  only:
+    - branches
+  except:
+    - master
+  tags:
+    - review-apps,nginx,deploy
+
+deploy to stage:
+  before_script: []
+  stage: deploy
+  only:
+    - master
+  script:
+    - echo "Deploy to stage"
+    - ruby -v
+    - rsync -av --delete ./* /home/gitlab-runner/stage
+    - cd /home/gitlab-runner/stage
+    - bundle install --jobs $(nproc) --path=~/cache/bundler "${FLAGS[@]}"
+    - mkdir -p tmp/sockets tmp/pids
+    - bin/restart_stage_puma.sh
+    #- bundle exec rails db:migrate
+  environment:
+    name: stage
+    url: http://stage.example.com
+  variables:
+    DATABASE_URL: "postgres://postgres@localhost/database_stage"
+    SECRET_KEY_BASE: $SECRET_KEY_BASE
+  tags:
+    - stage,nginx,deploy
